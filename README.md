@@ -73,11 +73,11 @@ Rscript code/cleaning.R
 
 Raw data is **not included** in this repository. Place files in the paths below before running the pipeline.
 
-| Dataset | Access | How to obtain | Local path |
-|---|---|---|---|
-| BASEforHANK Toolbox v1.5.0 | Public | Run `julia setup_BASEHANK.jl` (downloads automatically) | `src/`, `examples/` |
-| World Inequality Database (WID) | Public | Download from [wid.world](https://wid.world): country = CHL, variables = wealth shares (top 10%, top 1%), years = 1990–2023 | `data/raw/WID/` |
-| Encuesta Financiera de Hogares (EFH) 2024 | Public | Download from [Banco Central de Chile](https://www.bcentral.cl/areas/encuestas-economicas/encuesta-financiera-de-hogares): select EFH 2024, download all `.dta` files | `data/raw/EFH/` |
+| Dataset | Access | How to obtain | Downloaded | Local path |
+|---|---|---|---|---|
+| BASEforHANK Toolbox v1.5.0 | Public | Run `julia setup_BASEHANK.jl` (downloads automatically) | — | `src/`, `examples/` |
+| World Inequality Database (WID) | Public | [wid.world](https://wid.world): country = CHL, variables = wealth shares (top 10%, top 1%), years = 1990–2023 | 2026-02-26 | `data/raw/WID/` |
+| Encuesta Financiera de Hogares (EFH) 2024 | Public | [Banco Central de Chile](https://www.bcentral.cl/areas/encuestas-economicas/encuesta-financiera-de-hogares): EFH 2024, all `.dta` files | 2026-03-19 | `data/raw/EFH/` |
 
 ---
 
