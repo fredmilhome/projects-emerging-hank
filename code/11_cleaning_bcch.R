@@ -1,10 +1,22 @@
 # 11_cleaning_bcch.R
 # Pull macro time series from the Banco Central de Chile (BCCh) REST API.
-# Outputs: data/clean/bcch_quarterly.csv, data/clean/bcch_monthly.csv
+#
+# Output (timestamped, non-idempotent — each run creates a new folder):
+#   data/raw/bcch_raw/YYYYMMDD_HHMMSS/bcch_main.csv
+#   data/raw/bcch_raw/YYYYMMDD_HHMMSS/bcch_main.rds
+#
+# PULL ONLY — no deflation, no per-capita, no aggregation, no interpolation.
+# Series are stored at their native frequency (quarterly, monthly, or annual).
+# All transformation choices live in code/21_timeseries_processing.R.
+#
+# To read the most recent pull in another script:
+#   folder <- tail(sort(Sys.glob("data/raw/bcch_raw/*")), 1)
+#   bcch   <- readRDS(file.path(folder, "bcch_main.rds"))
 #
 # API docs: https://si3.bcentral.cl/SieteRestWS/SieteRestWS.ashx
 # Register for credentials at: https://si3.bcentral.cl/siete/
 
+library(httr)
 library(rjson)
 library(dplyr)
 library(tidyr)
@@ -14,64 +26,135 @@ library(lubridate)
 # CREDENTIALS — paste yours here
 # ---------------------------------------------------------------------------- #
 
-BCCH_USER <- "fred.coosta@hotmail.com"
-BCCH_PASS <- "I$beg1mtBU"
+BCCH_USER <- "fred.COOSTA@hotmail.com"
+BCCH_PASS <- "JtkyggDbQY7nkYxgkn6HKG2T"
 
 # ---------------------------------------------------------------------------- #
-# Series catalogue — BCCh series IDs for HANK estimation
+# Series catalogue
 # ---------------------------------------------------------------------------- #
-# To find additional series IDs use bcch_search() below, or browse:
-# https://si3.bcentral.cl/siete/
+# Each entry: name = BCCh series ID
+#
+# Native frequencies and properties:
+#   National accounts (pib, ddi, …): Quarterly | SA | Nominal CLP billions
+#   Deflator:                         Quarterly | SA | Index (2018 Q-avg = 100)
+#   Population:                       Annual    | —  | Persons
+#   Wage index:                       Monthly   | —  | Index (base yr 2023)
+#   Hours worked:                     Monthly   | —  | Level (hours)
+#
+# NOTE: FRED/Haver US national accounts use SAAR (SA + annualized ×4).
+#       BCCh national accounts are SA but NOT annualized — actual quarterly flows.
+#       For growth rates (log-diffs) this distinction is irrelevant.
+#       For level ratios (K/Y, G/Y), multiply BCCh quarterly flow ×4 for
+#       annual-rate equivalent before dividing.
 
 SERIES <- list(
-  # National Accounts (quarterly, real, 2018 pesos)
-  gdp               = "F032.PIB.FLU.R.CLP.EP18.Z.Z.0.T",   # GDP
-  consumption       = "F032.PIB.FLU.R.CLP.EP18.Z.Z.4.T",   # Private consumption
-  investment        = "F032.PIB.FLU.R.CLP.EP18.Z.Z.6.T",   # Gross fixed capital formation
-  gov_spending      = "F032.PIB.FLU.R.CLP.EP18.Z.Z.5.T",   # Government consumption
 
-  # Labor market (monthly)
-  unemployment      = "F026.EME.TAD.2022.D10.LCI.TOT.10.M", # Unemployment rate
-  employment        = "F026.EME.TAD.2022.D10.LCI.TOT.T.M",  # Employment (thousands)
+  # ── GDP Deflator ───────────────────────────────────────────────────────────
+  # SA, empalmado, referencia 2018. Index (2018 quarterly average = 100).
+  deflator       = "F032.PIB.DEF.N.CLP.EP18.Z.Z.1.T",
 
-  # Prices
-  cpi               = "F073.IPC.V12.2018.M",                 # CPI, 12-month change (monthly)
-  cpi_index         = "F073.IPC.VAR.2018.M",                 # CPI monthly change
+  # ── National Accounts — expenditure-side GDP tree ─────────────────────────
+  # All quarterly. Nominal CLP (billions of pesos), SA, empalmado ref 2018.
+  # Note: export/import sub-series use "2018" suffix instead of "EP18" in the
+  #       series code — same vintage and dataset.
+  #
+  # Accounting identities:
+  #   pib  = ddi + xbs - ibs
+  #   ddi  = cto + fbkf + vax
+  #   cto  = cpr + cog
+  #   cpr  = cdu + cnd + cse
+  #   fbkf = fbkf_const + fbkf_maq
+  #   xbs  = xbi + xse  ;  xbi = xap + xmi + xin
+  #   ibs  = ibi + ise  ;  ibi = iap + imi + iin
 
-  # Monetary policy
-  tpm               = "F022.TPM.TIN.D001.NO.Z.D",            # Monetary policy rate (daily)
+  pib            = "F032.PIB.FLU.N.CLP.EP18.Z.Z.1.T",   # PIB
+  ddi            = "F033.DDI.FLU.N.CLP.EP18.1.T",        # Demanda Interna
+  cto            = "F033.CTO.FLU.N.CLP.EP18.1.T",        # Consumo Total
+  cpr            = "F033.CPR.FLU.N.CLP.EP18.1.T",        # Consumo Hogares e IPSFL (incl. durables)
+  cdu            = "F033.CDU.FLU.N.CLP.EP18.1.T",        # Bienes Durables
+  cnd            = "F033.CND.FLU.N.CLP.EP18.1.T",        # Bienes No Durables
+  cse            = "F033.CSE.FLU.N.CLP.EP18.1.T",        # Servicios
+  cog            = "F033.COG.FLU.N.CLP.EP18.1.T",        # Consumo Gobierno
+  fbkf           = "F033.FKF.FLU.N.CLP.EP18.1.T",        # Formación Bruta de Capital Fijo
+  fbkf_const     = "F033.FKK.FLU.N.CLP.EP18.1.T",        # FBKF — Construcción y Otras Obras
+  fbkf_maq       = "F033.FKO.FLU.N.CLP.EP18.1.T",        # FBKF — Maquinaria y Equipo
+  vax            = "F033.VAX.FLU.N.CLP.EP18.1.T",        # Variación de Existencias
+  xbs            = "F033.XBS.FLU.N.CLP.EP18.1.T",        # Exportaciones Bienes y Servicios
+  xbi            = "F033.XBI.FLU.N.CLP.2018.1.T",        # Exportación Bienes
+  xap            = "F033.XAP.FLU.N.CLP.2018.1.T",        #   Agropecuario-Silvícola-Pesca
+  xmi            = "F033.XMI.FLU.N.CLP.2018.1.T",        #   Minería
+  xin            = "F033.XIN.FLU.N.CLP.2018.1.T",        #   Industria
+  xse            = "F033.XSE.FLU.N.CLP.2018.1.T",        # Exportación Servicios
+  ibs            = "F033.IBS.FLU.N.CLP.EP18.1.T",        # Importaciones Bienes y Servicios
+  ibi            = "F033.IBI.FLU.N.CLP.2018.1.T",        # Importación Bienes
+  iap            = "F033.IAP.FLU.N.CLP.2018.1.T",        #   Agropecuario-Silvícola-Pesca
+  imi            = "F033.IMI.FLU.N.CLP.2018.1.T",        #   Minería
+  iin            = "F033.IIN.FLU.N.CLP.2018.1.T",        #   Industria
+  ise            = "F033.ISE.FLU.N.CLP.2018.1.T",        # Importación Servicios
 
-  # Exchange rate
-  usd_clp           = "F073.TCO.PRE.Z.D",                    # USD/CLP (daily)
+  # ── Population ────────────────────────────────────────────────────────────
+  # Annual. One observation per year, stored as-is.
+  # Frequency alignment is handled in 21_timeseries_processing.R.
+  population     = "F049.POB.STO.INE1.01.A",             # Total population (INE projections)
 
-  # Wages
-  wage_index        = "F026.IRM.IRM.2016.M"                  # Real wage index (monthly)
+  # ── Wage Index ────────────────────────────────────────────────────────────
+  # Monthly. Índice de Remuneraciones Nominales (INE, base year 2023).
+  wage_index     = "G049.RMM.IND.INE23.NE.M",
+
+  # ── Hours Worked ──────────────────────────────────────────────────────────
+  # Monthly. Total hours worked (INE).
+  hours_worked   = "F049.HEO.PRO.INE1.01.M",
+
+  # ── Interbank Rate ────────────────────────────────────────────────────────
+  # Monthly (suffix .M).
+  interbank_rate_1d = "F022.TIB.TIP.D001.NO.Z.M",
+
+  # ── Debt to GDP ratio - IMF ───────────────────────────────────────────────
+  # Annual. Ratio of total public debt to GDP.
+  d_to_gdp_fmi    = "F019.DBPIB.PPIB.CH.A"
 )
 
-FIRST_DATE <- "1990-01-01"
+SERIES <- Filter(Negate(is.null), SERIES)   # remove sentinel
+
+FIRST_DATE <- "1954-01-01"
 LAST_DATE  <- format(Sys.Date(), "%Y-%m-%d")
 
 # ---------------------------------------------------------------------------- #
 # Helpers
 # ---------------------------------------------------------------------------- #
 
+BASE_URL <- "https://si3.bcentral.cl/SieteRestWS/SieteRestWS.ashx"
+
 bcch_url <- function(...) {
   args  <- list(...)
-  base  <- "https://si3.bcentral.cl/SieteRestWS/SieteRestWS.ashx"
   parts <- c(
     paste0("user=", BCCH_USER),
     paste0("pass=", BCCH_PASS),
     paste0(names(args), "=", unlist(args))
   )
-  paste0(base, "?", paste(parts, collapse = "&"))
+  paste0(BASE_URL, "?", paste(parts, collapse = "&"))
 }
 
-# Search available series by keyword and frequency
+# GET via httr, parse JSON — avoids rjson HTTPS issues on Windows
+bcch_get <- function(...) {
+  url  <- bcch_url(...)
+  resp <- tryCatch(GET(url, timeout(30)), error = function(e) {
+    warning("Connection error: ", e$message); NULL
+  })
+  if (is.null(resp) || status_code(resp) != 200) return(NULL)
+  txt    <- content(resp, as = "text", encoding = "UTF-8")
+  parsed <- tryCatch(rjson::fromJSON(txt), error = function(e) {
+    warning("JSON parse error: ", e$message); NULL
+  })
+  parsed
+}
+
+# Search available series by keyword
 bcch_search <- function(keyword = NULL, frequency = "QUARTERLY") {
-  url <- bcch_url(frequency = frequency, `function` = "SearchSeries")
-  raw <- rjson::fromJSON(file = url)
-  df  <- as.data.frame(do.call(rbind, lapply(raw$SeriesInfos, as.vector)),
-                        stringsAsFactors = FALSE)
+  raw <- bcch_get(frequency = frequency, `function` = "SearchSeries")
+  if (is.null(raw) || is.null(raw$SeriesInfos)) return(data.frame())
+  df <- as.data.frame(do.call(rbind, lapply(raw$SeriesInfos, as.vector)),
+                      stringsAsFactors = FALSE)
   if (!is.null(keyword)) {
     mask <- grepl(keyword, df$spanishTitle, ignore.case = TRUE) |
             grepl(keyword, df$englishTitle,  ignore.case = TRUE)
@@ -80,94 +163,146 @@ bcch_search <- function(keyword = NULL, frequency = "QUARTERLY") {
   df
 }
 
-# Fetch a single series by ID; returns a tidy data frame
+# Fetch a single series at its native frequency; returns tidy data frame
 bcch_fetch <- function(series_id, name,
                        first = FIRST_DATE, last = LAST_DATE) {
-  url <- bcch_url(
-    firstdate  = first,
-    lastdate   = last,
+  raw <- bcch_get(
+    `function` = "GetSeries",
     timeseries = series_id,
-    `function` = "GetSeries"
+    firstdate  = first,
+    lastdate   = last
   )
-  raw <- tryCatch(rjson::fromJSON(file = url), error = function(e) {
-    warning("Failed to fetch ", series_id, ": ", e$message)
+  if (is.null(raw) || is.null(raw$Series$Obs)) {
+    warning("No data for ", series_id,
+            if (!is.null(raw$Message)) paste0(": ", raw$Message))
     return(NULL)
-  })
-  if (is.null(raw) || is.null(raw$Series$Obs)) return(NULL)
+  }
 
-  df <- as.data.frame(
-    do.call(rbind, lapply(raw$Series$Obs, as.vector)),
-    stringsAsFactors = FALSE
-  ) |>
+  df <- do.call(rbind, lapply(raw$Series$Obs, function(obs) {
+    data.frame(
+      indexDateString = as.character(obs$indexDateString),
+      value           = as.character(obs$value),
+      statusCode      = as.character(obs$statusCode),
+      stringsAsFactors = FALSE
+    )
+  })) |>
     transmute(
-      date       = dmy(indexDateString),
-      value      = suppressWarnings(as.numeric(value)),
-      status     = statusCode,
-      series_id  = series_id,
-      series     = name
+      date      = dmy(indexDateString),
+      value     = suppressWarnings(as.numeric(value)),
+      status    = statusCode,
+      series_id = series_id,
+      series    = name
     ) |>
     filter(status == "OK", !is.na(value))
 
   df
 }
 
+# Safe wrapper: logs result or failure; never aborts the script
+safe_fetch <- function(series_id, name) {
+  result <- tryCatch(
+    bcch_fetch(series_id, name),
+    error = function(e) {
+      message(sprintf("  ERROR  '%s' (%s): %s", name, series_id, e$message))
+      NULL
+    }
+  )
+  if (is.null(result)) {
+    message(sprintf("  SKIP   '%s' (%s) — absent from output", name, series_id))
+  } else {
+    message(sprintf("  OK     %-16s  %4d obs  %s – %s",
+                    paste0("'", name, "'"),
+                    nrow(result),
+                    format(min(result$date)),
+                    format(max(result$date))))
+  }
+  result
+}
+
 # ---------------------------------------------------------------------------- #
 # 1. Fetch all series
 # ---------------------------------------------------------------------------- #
 
-raw_list <- mapply(bcch_fetch,
+cat(sprintf("Fetching %d series from BCCh REST API...\n\n", length(SERIES)))
+
+raw_list <- mapply(safe_fetch,
                    series_id = unlist(SERIES),
                    name      = names(SERIES),
                    SIMPLIFY  = FALSE)
 
-raw_list <- Filter(Negate(is.null), raw_list)
-
+raw_list   <- Filter(Negate(is.null), raw_list)
 all_series <- bind_rows(raw_list)
 
-cat("Fetched", n_distinct(all_series$series), "series,",
-    nrow(all_series), "observations\n")
-cat("Date range:", format(range(all_series$date)), "\n\n")
+n_ok   <- n_distinct(all_series$series)
+n_tot  <- length(SERIES)
+n_skip <- n_tot - n_ok
+
+cat(sprintf("\nFetched %d of %d series", n_ok, n_tot))
+if (n_skip > 0) {
+  skipped <- setdiff(names(SERIES), unique(all_series$series))
+  cat(sprintf(" | %d skipped: %s", n_skip, paste(skipped, collapse = ", ")))
+}
+cat("\n")
+cat("Full date range:", format(range(all_series$date)), "\n")
 
 # ---------------------------------------------------------------------------- #
-# 2. Aggregate to quarterly
+# 2. Quick checks
 # ---------------------------------------------------------------------------- #
 
-# Tag each observation with its frequency (daily/monthly/quarterly)
-# High-frequency series → average within quarter
-quarterly <- all_series |>
-  mutate(
-    year    = year(date),
-    quarter = quarter(date),
-    qdate   = as.Date(paste0(year, "-", (quarter - 1) * 3 + 1, "-01"))
+# Coverage by series
+coverage <- all_series |>
+  group_by(series, series_id) |>
+  summarise(
+    n_obs      = n(),
+    date_first = min(date),
+    date_last  = max(date),
+    .groups    = "drop"
   ) |>
-  group_by(series, series_id, qdate) |>
-  summarise(value = mean(value, na.rm = TRUE), .groups = "drop") |>
-  rename(date = qdate) |>
-  arrange(series, date)
+  arrange(series)
 
-# ---------------------------------------------------------------------------- #
-# 3. Save
-# ---------------------------------------------------------------------------- #
+cat("\n=== Series coverage ===\n")
+print(as.data.frame(coverage))
 
-dir.create("data/clean", recursive = TRUE, showWarnings = FALSE)
-
-write.csv(all_series, "data/clean/bcch_raw.csv",       row.names = FALSE)
-write.csv(quarterly,  "data/clean/bcch_quarterly.csv", row.names = FALSE)
-
-cat("Saved data/clean/bcch_raw.csv\n")
-cat("Saved data/clean/bcch_quarterly.csv\n\n")
-
-# ---------------------------------------------------------------------------- #
-# 4. Quick check — wide quarterly table for the main HANK series
-# ---------------------------------------------------------------------------- #
-
-hank_series <- c("gdp", "consumption", "investment", "gov_spending",
-                 "cpi", "tpm", "unemployment")
-
-quarterly |>
-  filter(series %in% hank_series) |>
+# GDP accounting identity check
+# Monthly / annual series produce NAs when pivoting wide — expected.
+wide_check <- all_series |>
   select(date, series, value) |>
-  pivot_wider(names_from = series, values_from = value) |>
-  arrange(date) |>
-  tail(12) |>
-  print()
+  pivot_wider(names_from = series, values_from = value)
+
+required_ids <- c("pib", "cpr", "cog", "fbkf", "vax", "xbs", "ibs")
+
+if (all(required_ids %in% names(wide_check))) {
+  id_check <- wide_check |>
+    filter(!is.na(pib), !is.na(cpr), !is.na(fbkf)) |>
+    mutate(residual = pib - (cpr + cog + fbkf + vax + xbs - ibs))
+  cat(sprintf(
+    "\nGDP identity — max absolute residual: %.3f billion CLP\n",
+    max(abs(id_check$residual), na.rm = TRUE)
+  ))
+  cat("(Near 0 expected; non-zero reflects SA rounding across sub-series)\n")
+} else {
+  missing_ids <- setdiff(required_ids, names(wide_check))
+  cat(sprintf("\nGDP identity check skipped — missing series: %s\n",
+              paste(missing_ids, collapse = ", ")))
+}
+
+# ---------------------------------------------------------------------------- #
+# 3. Save — timestamped folder, fixed filenames inside
+# ---------------------------------------------------------------------------- #
+# Each run creates a new folder: data/raw/bcch_raw/YYYYMMDD_HHMMSS/
+# Inside: 2 files with stable names (no timestamp in filename).
+#
+# To read the most recent pull in another script:
+#   folder <- tail(sort(Sys.glob("data/raw/bcch_raw/*")), 1)
+#   bcch   <- readRDS(file.path(folder, "bcch_main.rds"))
+
+ts      <- format(Sys.time(), "%Y%m%d_%H%M%S")
+out_dir <- file.path("data", "raw", "bcch_raw", ts)
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+write.csv(all_series, file.path(out_dir, "bcch_main.csv"), row.names = FALSE)
+saveRDS(all_series,   file.path(out_dir, "bcch_main.rds"))
+
+cat(sprintf("\nSaved to %s/\n", out_dir))
+cat("  bcch_main.csv  — all series (quarterly / monthly / annual)\n")
+cat("  bcch_main.rds\n")

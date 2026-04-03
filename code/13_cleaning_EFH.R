@@ -1,11 +1,8 @@
 # cleaning.R — Data Cleaning for WID and EFH Data
 # =================================================
 #
-# Processes two raw data sources for HANK model calibration:
+# Processes EFH raw data sources for HANK model calibration:
 #
-#   1. WID — World Inequality Database wealth share series
-#      Input:  data/raw/WID/WID_Data_26022026-181954.csv
-#      Output: data/clean/wid_wealth_shares.csv
 #
 #   2. EFH — Encuesta Financiera de Hogares 2024 (imputed)
 #      Input:  data/raw/EFH/Base imputada EFH 2024.dta
@@ -25,56 +22,8 @@ library(tidyr)
 
 clean_dir <- here("data", "clean")
 
-wid_raw_file    <- here("data", "raw", "WID", "WID_Data_26022026-181954.csv")
-wid_output_file <- here(clean_dir, "wid_wealth_shares.csv")
-
 efh_raw_file    <- here("data", "raw", "EFH", "Base imputada EFH 2024.dta")
 efh_output_file <- here(clean_dir, "efh_households.csv")
-
-# ══════════════════════════════════════════════════════════════════════════════
-# 1. WID — Wealth share series
-# ══════════════════════════════════════════════════════════════════════════════
-
-percentile_labels <- c(
-  p90p100 = "Top 10%",
-  p99p100 = "Top 1%",
-  p0p50   = "Bottom 50%"
-)
-
-# The WID export has:
-#   - Row 1: "Downloaded from wid.world …" (skip)
-#   - Row 2: header with embedded newlines inside quotes
-#   - Row 3+: data
-# We skip the banner and rename columns positionally.
-
-read_wid_csv <- function(filepath) {
-  df <- read_delim(
-    filepath,
-    delim          = ";",
-    skip           = 1,
-    name_repair    = "minimal",
-    show_col_types = FALSE
-  )
-  names(df) <- c("percentile", "year", "Mexico", "Brazil", "Chile")
-  df
-}
-
-clean_wid <- function(df) {
-  df |>
-    pivot_longer(
-      cols      = c(Mexico, Brazil, Chile),
-      names_to  = "country",
-      values_to = "share"
-    ) |>
-    mutate(
-      percentile_label = percentile_labels[percentile],
-      year             = as.integer(year),
-      share            = as.numeric(share)
-    ) |>
-    filter(!is.na(share)) |>
-    arrange(country, percentile, year) |>
-    select(year, percentile, percentile_label, country, share)
-}
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 2. EFH — Household balance sheets
@@ -118,11 +67,17 @@ read_efh <- function(filepath) {
       act_toth,
       d_toth, d_vp, d_nhip
     ) |>
+    # Following Weiss thesis cited in BBL, we abstract from vehicle assets
+    # and define borrowers based on net liquid assets. To get aggregate portfolio liquidity,
+    # households with positive liquid assets and non positive total should be deleted in the
+    # calibration targets, but we keep this in the calibration targets calculation script.
     mutate(
       across(everything(), as.numeric),
-      net_wealth       = act_toth - d_toth,
-      illiquid_assets  = act_vp + act_otp + act_vehic,
-      liquid_assets    = act_ahcta + act_fin
+      net_illiquid_assets  = act_vp + act_otp - d_vp,
+      net_liquid_assets    = act_ahcta + act_fin - d_nhip,
+      net_total_assets = net_illiquid_assets + net_liquid_assets,
+      portfolio_liquidity = net_liquid_assets / net_total_assets,
+      borrower = net_liquid_assets < 0
     )
 }
 
@@ -132,13 +87,6 @@ read_efh <- function(filepath) {
 
 main <- function() {
   dir.create(clean_dir, recursive = TRUE, showWarnings = FALSE)
-
-  # WID
-  message("── WID ──────────────────────────────────────────────────")
-  message("Reading: ", wid_raw_file)
-  wid <- read_wid_csv(wid_raw_file) |> clean_wid()
-  write_csv(wid, wid_output_file)
-  message("Written: ", wid_output_file, " (", nrow(wid), " rows)")
 
   # EFH
   message("\n── EFH ──────────────────────────────────────────────────")
